@@ -368,8 +368,8 @@ def prepare_for_fasttree_meta(
 
     n_fillable = len(fillable_bins)
     if n_fillable > 0:
-        a = sum(len(bd["q_entries"]) for bd in fillable_bins) / n_fillable
-        b = sum(len(bd["kv_req_indices"]) for bd in fillable_bins) / n_fillable
+        b = sum(len(bd["q_entries"]) for bd in fillable_bins) / n_fillable
+        a = sum(len(bd["kv_req_indices"]) for bd in fillable_bins) / n_fillable
     else:
         a = 0.0
         b = 0.0
