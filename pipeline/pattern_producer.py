@@ -20,7 +20,6 @@ CUSUM_MAX_WAIT_SECONDS = None
 PARTITION_QUEUE_NAME = "_pending_partitions.txt"
 PARTITION_CD = 15
 PARTITION_QUEUE_CAPACITY = 1
-SUB_PATTERN_DEPTH_L = 3
 ROW_SCALE_THRESHOLD_S = 3000
 ENABLE_ROW_DEDUP = False
 
@@ -165,8 +164,7 @@ class PatternNode:
         self.row_count = int(count)            
         self.unextracted_mask = None           
         self.unextracted_rows = None 
-        self.unextracted_count = int(count)    
-        self.sub_patterns = []                 
+        self.unextracted_count = int(count)              
         self.score = 0.0                       
 
     def __repr__(self):
@@ -198,7 +196,7 @@ class PatternRegistry:
             for it in node.items:
                 mask &= self.item_masks[it]
             node.row_count = mask.count()
-            node.unextracted_count = node.row_count
+            node.unextracted_count = min(int(count), node.row_count)
 
             if node.row_count * 32 < self.num_rows:
                 buf  = np.frombuffer(mask.tobytes(), dtype=np.uint8)
@@ -210,11 +208,6 @@ class PatternRegistry:
                 node.unextracted_rows = None
 
         self.key_to_node[key] = node
-
-        for it in node.items:
-            sub_node = self.key_to_node.get(key - frozenset([it]))
-            if sub_node is not None:
-                node.sub_patterns.append(sub_node)
         return node
 
 def write_file_with_handle(writter, patterns: list[list[str]], tokenizer, counts,
@@ -641,32 +634,12 @@ class NegFIN:
         self.pattern_registry.on_high_potential_ended = self._on_high_potential_ended
         self.__write_initial_uncovered_partition()
 
-
-    def __finalize_pattern_containment(self):
-        registry = self.pattern_registry.key_to_node
-        for node in registry.values():
-            node.sub_patterns = []
-            for it in node.items:
-                sub_node = registry.get(node.item_key - frozenset([it]))
-                if sub_node is not None:
-                    node.sub_patterns.append(sub_node)
-
     def compute_pattern_score(self, node: PatternNode) -> float:
-        def dfs(current_node: PatternNode, remaining_depth: int) -> float:
-            if remaining_depth <= 0 or not current_node.sub_patterns:
-                return 0.0
-            share_count = current_node.unextracted_count
-            if share_count <= 0:
-                return 0.0
-            best_gain = 0.0
-            for child in current_node.sub_patterns:
-                step_gain = child.token_length / share_count                
-                branch_gain = step_gain + dfs(child, remaining_depth - 1)   
-                if branch_gain > best_gain:
-                    best_gain = branch_gain
-            return best_gain
+        n = node.unextracted_count
+        if n <= 1:
+            return 0.0
+        return node.token_length * (n - 1) / n
 
-        return node.token_length + dfs(node, SUB_PATTERN_DEPTH_L - 1)
 
     @staticmethod
     def np_packed_not(mask_np: np.ndarray, num_rows: int) -> bitarray:
@@ -718,7 +691,6 @@ class NegFIN:
         if self.output_row_mask_np is None or self.output_row_mask_np.shape[0] != num_rows:
             self.output_row_mask_np = np.zeros(num_rows, dtype=bool)
 
-        self.__finalize_pattern_containment()
         all_nodes = list(self.pattern_registry.key_to_node.values())
         for node in all_nodes:
             node.score = self.compute_pattern_score(node)
@@ -903,7 +875,6 @@ class NegFIN:
             return
 
         all_nodes = list(self.pattern_registry.key_to_node.values())
-        self.__finalize_pattern_containment()
 
         for node in all_nodes:
             node.score = self.compute_pattern_score(node)
