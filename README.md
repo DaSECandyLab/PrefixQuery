@@ -9,4 +9,4 @@ pipeline - the core code of our pattern miner and data reorganizer, including pi
 
 ## Proof
 
-the proof material of NP-Hard difficulty of data reordering. Please check the file with 'normal' suffix.
+the proof material of NP-Hard difficulty of data reordering. Please check the file with 'normal' suffix. 
