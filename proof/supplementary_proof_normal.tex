@@ -1,0 +1,160 @@
+\section{NP-Hardness of Data Reordering}
+\label{sec:supp-np-hardness}
+
+In this section, we establish the NP-hardness of the data reordering problem introduced in Section III-A. Rather than directly analyzing the general problem, we consider a restricted setting with four conditions: 
+(i) every row shares the values of two of its columns with other rows in the table; (ii) any two rows share the same column value in at most one column; (iii) every column--value pair appearing in the data consists of the same number of tokens; and (iv) every shared column--value pair is contained in exactly three rows.
+Under this restriction, shared prefixes cannot extend beyond the first trie level. We first formulate this restricted problem and then prove its NP-hardness through a polynomial-time reduction from Vertex Cover. 
+Since the restricted problem is a special case of the general data reordering problem, this result also establishes the NP-hardness of the original problem.
+
+\textbf{Restricted problem formulation.} 
+Suppose a relational table contains $m$ rows, and each row consists of $k \geq 2$ columns. By condition~(iii), every column–value pair appearing in the data consists of the same number of tokens, denoted $t_0>0$. By condition~(i), each row shares the values of exactly two of its columns with other rows; we refer to these two column--value pairs as the \emph{shared pairs} of the row, and to the remaining $k-2$ column--value pairs, which appear in no other row, as its \emph{exclusive pairs}. Moreover, by condition~(ii), any two rows share the same column value in at most one column, so no two rows can match a common prefix of two or more trie levels. Consequently, under this restriction, all prefix reuse occurs at the first trie level, and the total benefit depends only on which column--value pair each row places at the first level.
+
+\emph{Candidate nodes.} Although every column--value pair could, in principle, serve as a first-level trie node, we now show that it suffices to take only the shared pairs as candidate nodes. Since all pairs carry the same token length $t_0$, the reuse benefit of leading a row with a given pair depends only on the number of rows that lead with the same pair, and not on which pair it is. Consider a row $j$ and one of its shared pairs, represented by candidate node $i$. If no row other than $j$ is assigned to node $i$, then assigning row $j$ to this node yields zero reuse benefit, which is identical to the benefit of leading with any of its exclusive pairs. If, in contrast, node $i$ is also assigned to other rows, then the benefit of joining it is strictly positive, which strictly dominates leading with an exclusive pair, since an exclusive pair can never be reused. Therefore, for every row, leading with a shared pair is always at least as good as leading with an exclusive pair, and we may restrict the candidate nodes to the shared column--value pairs without loss of optimality. Let the first trie level contain $n$ candidate nodes, one for each distinct shared column--value pair in the data. For the $i$-th candidate node and the $j$-th row, we define $a_{ij}\in\{0,1\}$ to indicate whether they match. Specifically, $a_{ij}=1$ if the shared pair represented by node $i$ belongs to row $j$, and $a_{ij}=0$ otherwise. Since each row has exactly two shared pairs, we have
+\begin{equation}
+\sum_{i=1}^{n}a_{ij}=2, \qquad 1\leq j\leq m.
+\label{eq:supp-match}
+\end{equation}
+We further introduce a binary decision variable $x_{ij}$ to indicate whether the $j$-th row selects the $i$-th candidate node as its first-level trie node. As argued above, each row can be assumed to lead with one of its two shared pairs, giving the following constraints:
+\begin{equation}
+\begin{aligned}
+\sum_{i=1}^{n}x_{ij} &= 1, && \forall j,\\
+x_{ij} &\leq a_{ij}, && \forall i,j,\\
+x_{ij} &\in\{0,1\}, && \forall i,j.
+\end{aligned}
+\label{eq:supp-constraints}
+\end{equation}
+Let $r_i=\sum_{j=1}^{m}x_{ij}$ denote the number of rows assigned to node $i$. 
+By condition~(iv), each shared column--value pair is contained
+in exactly three rows, and hence $r_i \leq 3$ for all $i$.
+Since shared prefixes cannot extend beyond the first trie level, the first row assigned to node $i$ performs the initial KV computation, while each of the remaining $r_i-1$ rows reuses the corresponding prefix KV states of length $t_0$. The reuse benefit of node $i$ is thus
+\begin{equation}
+B_i=\max\{(r_i-1)t_0,\,0\},
+\end{equation}
+and the restricted data reordering problem can be formulated as
+\begin{equation}
+\begin{aligned}
+\max_{\{x_{ij}\}}\quad & \sum_{i=1}^{n}B_i\\
+\mathrm{s.t.}\quad & \eqref{eq:supp-constraints}.
+\end{aligned}
+\label{eq:supp-restricted}
+\end{equation}
+
+\textbf{Benefit simplification.} Let $S=\{i:r_i\geq1\}$ denote the set of candidate nodes used by an assignment. Since each row selects exactly one node, the assignment counts satisfy
+\begin{equation}
+\sum_{i=1}^{n}r_i=m.
+\label{eq:supp-count}
+\end{equation}
+For every used node $i\in S$, we have $r_i\geq1$, and hence $B_i=(r_i-1)t_0$, while $B_i=0$ applies to all unused nodes. Combining this with~\eqref{eq:supp-count}, the total prefix reuse benefit can be expressed as
+\begin{equation}
+\begin{aligned}
+B &=\sum_{i=1}^{n}B_i
+   =t_0\sum_{i\in S}(r_i-1)\\
+  &=t_0\left(\sum_{i\in S}r_i-|S|\right)
+   =t_0\,(m-|S|).
+\end{aligned}
+\label{eq:supp-benefit}
+\end{equation}
+Since both $m$ and $t_0$ are fixed for a given instance, maximizing the total reuse benefit $B$ is equivalent to minimizing the number of used candidate nodes $|S|$. Note that for any row, if both of its associated candidate nodes have already been used, assigning the row to either node yields the identical benefit; in this case, we can assign the row to either one of the two candidate nodes. Therefore, the objective reduces to selecting as few shared column--value pairs as possible such that every row can be assigned to one of its two shared pairs, which we exploit in the following reduction.
+
+\textbf{Reduction from Vertex Cover.}
+We reduce Vertex Cover on simple cubic graphs, i.e., simple graphs where every vertex has degree exactly $3$, to the restricted problem~\cite{AlimontiKann2000}. Let $G = (V, E)$ be such an
+instance with $|V| = n$ and $|E| = m$. 
+Vertex Cover remains NP-hard (indeed, APX-complete) on cubic graphs~\cite{AlimontiKann2000}, so $G$ is a valid source of NP-hardness.
+We construct a
+corresponding instance of the restricted data reordering problem as follows.
+
+\emph{Construction.} Index the vertices as
+$V=\{v_1,\dots,v_n\}$ and the edges as $E=\{e_1,\dots,e_m\}$, and
+let candidate node $i$ correspond to vertex $v_i$ for
+$1\leq i\leq n$. The relational table contains $m=|E|$ rows and
+$k\geq 2$ columns. For each edge $e_j = (u, v) \in E$, row $j$ holds
+the two shared column--value pairs represented by the candidate nodes
+of $u$ and $v$, together with $k - 2$ exclusive column--value pairs 
+that appear in no other row in the remaining columns. Since $G$ is
+cubic, the shared column--value pair corresponding to each vertex
+$u \in V$ appears in exactly the three rows associated with the
+three edges incident to $u$. The first trie level contains exactly
+$n$ candidate nodes, one per vertex, and every candidate node has
+the same positive token length $t_0$; by construction, the exclusive pairs carry the same length
+$t_0$ as well.
+Since distinct edges of a simple graph share at most one
+endpoint, any two rows share the same column value in at most one column.
+Moreover, each row contains exactly two shared pairs, which correspond to its two endpoints. Overall, the constructed instance satisfies all four restriction conditions. 
+
+The construction explicitly writes only the $n$ candidate
+node labels, one per vertex; each of the $mk$ table cells is determined
+by a simple rule (the two shared pairs of row $j$ are the candidate
+nodes of its two endpoints, and each exclusive pair carries a value
+unique to its row and column). Verifying all $mk$ cells thus takes
+$O(mk)$ time, and the construction is computable in $O(mk+n)$ time,
+polynomial in the size of $G$.
+
+\begin{lemma}[Assignments induce covers]
+\label{lem:cover}
+For every assignment
+$\{x_{ij}\}$ feasible for~\eqref{eq:supp-constraints}, the set
+$S=\{i:\sum_{j=1}^{m}x_{ij}\geq 1\}$ of used candidate nodes is a vertex
+cover of $G$.
+\end{lemma}
+
+\begin{proof}
+Fix any edge $e_j=(u,v)$. Constraint~\eqref{eq:supp-constraints}
+requires row $j$ to select exactly one node, say $i$, with $x_{ij}=1$ and
+$x_{ij}\leq a_{ij}$. Row $j$ matches only the two candidate nodes
+representing $u$ and $v$, since its remaining column--value pairs are
+exclusive and hence do not correspond to any candidate node. Therefore
+$i\in\{u,v\}$; since $x_{ij}=1$ we have $r_i\geq 1$, i.e., $i\in S$. Hence
+every edge of $G$ is covered by $S$.
+\end{proof}
+
+\begin{lemma}[Covers induce assignments]
+\label{lem:assign}
+For every vertex cover
+$C\subseteq V$ of $G$ with $|C|\leq\ell$, there exists an assignment
+feasible for~\eqref{eq:supp-constraints} that uses at most $|C|$ candidate
+nodes.
+\end{lemma}
+
+\begin{proof}
+For each edge $e_j=(u,v)$, the set $C\cap\{u,v\}$ is nonempty
+because $C$ is a vertex cover; select an arbitrary endpoint $i_j$ in it and
+set $x_{i_j j}=1$ and $x_{i'j}=0$ for all $i'\neq i_j$. Each row then selects
+exactly one matching node, so~\eqref{eq:supp-constraints} holds. Every used
+node lies in $C$, and every node in $C$ that is used is counted once, hence
+$|S|\leq|C|\leq\ell$. 
+\end{proof}
+
+\emph{Objective equivalence.} By~\eqref{eq:supp-benefit}, for any feasible
+assignment on this instance, since all token lengths equal $t_0$ and
+$\sum_{i=1}^{n}r_i=m$, the total reuse benefit is
+\begin{equation}
+B = t_0\,(m-|S|).
+\label{eq:supp-cover-benefit}
+\end{equation}
+Combining Lemmas~\ref{lem:cover} and~\ref{lem:assign} with this
+identity yields, for any threshold $\ell$:
+\begin{equation}
+\begin{aligned}
+&\exists\ \text{feasible assignment with } B\geq t_0(m-\ell)\\
+\iff\ & G \text{ has a vertex cover of size at most } \ell.
+\end{aligned}
+\label{eq:supp-equivalence}
+\end{equation}
+($\Rightarrow$) by Lemma~\ref{lem:cover}, $S$ is a vertex cover and,
+by identity~\eqref{eq:supp-cover-benefit}, $|S|=m-B/t_0\leq\ell$.
+($\Leftarrow$) by Lemma~\ref{lem:assign}, there exists a
+feasible assignment whose used-node set $S$ satisfies
+$S\subseteq C$ and $|S|\leq|C|\leq\ell$; by
+identity~\eqref{eq:supp-cover-benefit}, this assignment achieves
+\[
+B=t_0(m-|S|)\ \geq\ t_0(m-|C|)\ \geq\ t_0(m-\ell).
+\]
+
+\emph{Hardness.} 
+The above reduction is polynomial in the input size and
+maps an arbitrary instance of Vertex Cover on simple cubic graphs to an
+instance of the restricted data reordering problem satisfying all four restrictions. Since the source
+problem is NP-hard~\cite{AlimontiKann2000}, the restricted data
+reordering problem is NP-hard. Furthermore, the restricted problem is a
+special case of the general data reordering problem. Therefore, the
+general trie-based data reordering problem is also NP-hard.

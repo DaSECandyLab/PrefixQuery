@@ -7,6 +7,6 @@ fasttree - the core code of our decoding attention kernel.
 
 pipeline - the core code of our pattern miner and data reorganizer, including pipeline strategy and reordering method.
 
-## Material
+## Proof
 
-the supplementary material is listed in the root dictionary, including the detail of pipeline strategy and the analysis of data ordering's difficulty.
+the proof material of NP-Hard difficulty of data reordering. Please check the file with 'normal' suffix.
