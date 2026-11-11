@@ -1,7 +1,7 @@
 # PrefixQuery
-PrefixQuery Source code and Supplementary Material. Currently, we only provide the core code of our algorithms. The full version will be launched after the paper is accepted.
+PrefixQuery Source code and Supplementary Material. Currently, we only provide the core code of our algorithms. 
 
-## Dictionaries
+## Code
 
 fasttree - the core code of our decoding attention kernel.
 
