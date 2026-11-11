@@ -325,10 +325,11 @@ def prepare_for_fasttree_meta(
             if q_overlap == 0 and kv_overlap == 0:
                 continue
 
-            if q_overlap > 0:
-                memory = 3 * q_overlap
-            else:
-                memory = 2 * kv_overlap
+            # if q_overlap > 0:
+            #     memory = 3 * q_overlap
+            # else:
+            #     memory = 2 * kv_overlap
+            memory = 3 * q_overlap + 2 * kv_overlap
 
             q_excl_lv = lv_q_set - b_q_set
             q_excl_bin = b_q_set - lv_q_set

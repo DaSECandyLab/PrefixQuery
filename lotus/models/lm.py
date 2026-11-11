@@ -1,0 +1,614 @@
+import hashlib
+import logging
+import math
+import time
+import warnings
+from collections import deque
+from typing import Any
+
+import numpy as np
+from litellm import batch_completion
+from litellm.exceptions import AuthenticationError
+from litellm.types.utils import ChatCompletionTokenLogprob, ChoiceLogprobs, Choices, ModelResponse
+from litellm.utils import decode, encode, token_counter
+from openai._exceptions import OpenAIError
+from pydantic import BaseModel
+from tokenizers import Tokenizer
+from tqdm import tqdm
+
+import lotus
+from lotus.cache import CacheFactory
+from lotus.pricing import calculate_cost_from_response
+from lotus.types import (
+    LMOutput,
+    LMStats,
+    LogprobsForCascade,
+    LogprobsForFilterCascade,
+    LotusUsageLimitException,
+    UsageLimit,
+)
+
+logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
+logging.getLogger("httpx").setLevel(logging.CRITICAL)
+
+# Suppress Pydantic serialization warnings emitted by litellm when its ModelResponse
+# Choices/Message types don't exactly match the expected StreamingChoices schema.
+# This is a known upstream litellm issue and the warnings are harmless — the values
+# are still serialized correctly.
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings", category=UserWarning, module="pydantic.*")
+
+
+class LM:
+    """
+    Language Model class for interacting with various LLM providers.
+
+    This class provides a unified interface for making requests to different language
+    model providers through LiteLLM. It supports caching, rate limiting, usage tracking,
+    and batch processing for efficient API usage.
+
+    The class maintains separate physical and virtual usage statistics, where:
+    - Physical usage: Actual API calls made (with caching applied)
+    - Virtual usage: Total usage if no caching was used
+
+    Attributes:
+        model (str): Name of the model to use.
+        max_ctx_len (int): Maximum context length in tokens.
+        max_tokens (int): Maximum number of tokens to generate.
+        rate_limit (int | None): Maximum requests per minute.
+        max_batch_size (int): Maximum batch size for concurrent requests.
+        tokenizer (Tokenizer | None): Custom tokenizer instance.
+        kwargs (dict): Configuration parameters for the LLM API.
+        stats (LMStats): Usage statistics tracking.
+        physical_usage_limit (UsageLimit): Physical usage limits.
+        virtual_usage_limit (UsageLimit): Virtual usage limits.
+        cache: Cache instance for storing responses.
+    """
+
+    def __init__(
+        self,
+        model: str = "gpt-4o-mini",
+        temperature: float = 0.0,
+        max_ctx_len: int = 128000,
+        max_tokens: int = 512,
+        max_batch_size: int = 64,
+        rate_limit: int | None = None,
+        tpm_limit: int | None = None,
+        tokenizer: Tokenizer | None = None,
+        cache: Any = None,
+        physical_usage_limit: UsageLimit = UsageLimit(),
+        virtual_usage_limit: UsageLimit = UsageLimit(),
+        **kwargs: dict[str, Any],
+    ):
+        """
+        Initialize the Language Model instance.
+
+        Args:
+            model (str): Name of the model to use. Defaults to "gpt-4o-mini".
+            temperature (float): Sampling temperature. Defaults to 0.0.
+            max_ctx_len (int): Maximum context length in tokens. Defaults to 128000.
+            max_tokens (int): Maximum number of tokens to generate. Defaults to 512.
+            max_batch_size (int): Maximum batch size for concurrent requests. Defaults to 64.
+            rate_limit (int | None): Maximum requests per minute. If set, caps max_batch_size and adds delays.
+            tokenizer (Tokenizer | None): Custom tokenizer instance. Defaults to None.
+            cache: Cache instance to use. Defaults to None.
+            physical_usage_limit (UsageLimit): Physical usage limits for the model. Defaults to UsageLimit().
+            virtual_usage_limit (UsageLimit): Virtual usage limits for the model. Defaults to UsageLimit().
+            **kwargs: Additional keyword arguments passed to the underlying LLM API.
+        """
+        self.model = model
+        self.max_ctx_len = max_ctx_len
+        self.max_tokens = max_tokens
+        self.rate_limit = rate_limit
+        self.tpm_limit = tpm_limit
+        self._token_usage_history: deque = deque()  # (timestamp, tokens)
+
+        if rate_limit is not None:
+            self._rate_limit_delay: float = 60 / rate_limit
+            if max_batch_size is not None:
+                self.max_batch_size = min(rate_limit, max_batch_size)
+            else:
+                self.max_batch_size = rate_limit
+        else:
+            self.max_batch_size = max_batch_size
+        self.tokenizer = tokenizer
+        # Use max_completion_tokens - LiteLLM translates to max_tokens for older models automatically
+        self.kwargs = dict(temperature=temperature, max_completion_tokens=max_tokens, **kwargs)
+
+        self.stats: LMStats = LMStats()
+        self.physical_usage_limit = physical_usage_limit
+        self.virtual_usage_limit = virtual_usage_limit
+
+        self.cache = cache if cache is not None else CacheFactory.create_default_cache()
+
+    def __call__(
+        self,
+        messages: list[list[dict[str, str]]],
+        show_progress_bar: bool = True,
+        progress_bar_desc: str = "Processing uncached messages",
+        **kwargs: dict[str, Any],
+    ) -> LMOutput:
+        all_kwargs = {**self.kwargs, **kwargs}
+
+        # Set top_logprobs if logprobs requested
+        if all_kwargs.get("logprobs", False):
+            all_kwargs.setdefault("top_logprobs", 10)
+
+        if lotus.settings.enable_cache:
+            # Check cache and separate cached and uncached messages
+            hashed_messages = [self._hash_messages(msg, all_kwargs) for msg in messages]
+            cached_responses_raw = [self.cache.get(hash) for hash in hashed_messages]
+            # Filter out None values and ensure they are ModelResponse
+            cached_responses: list[ModelResponse | None] = []
+            for resp in cached_responses_raw:
+                if resp is None:
+                    cached_responses.append(None)
+                elif isinstance(resp, ModelResponse):
+                    cached_responses.append(resp)
+                else:
+                    # Skip invalid cached responses
+                    cached_responses.append(None)
+        else:
+            hashed_messages = []
+            cached_responses = []
+
+        uncached_data = (
+            [(msg, hash) for msg, hash, resp in zip(messages, hashed_messages, cached_responses) if resp is None]
+            if lotus.settings.enable_cache
+            else [(msg, "no-cache") for msg in messages]
+        )
+
+        self.stats.cache_hits += len(messages) - len(uncached_data)
+
+        # Process uncached messages in batches
+        uncached_responses = self._process_uncached_messages(
+            uncached_data, all_kwargs, show_progress_bar, progress_bar_desc
+        )
+
+        # Add new responses to cache and update stats
+        for resp, (_, hash) in zip(uncached_responses, uncached_data):
+            self._update_stats(resp, is_cached=False)
+            if lotus.settings.enable_cache:
+                self._cache_response(resp, hash)
+
+        # Update virtual stats for cached responses
+        if lotus.settings.enable_cache:
+            for resp in cached_responses:
+                if resp is not None and isinstance(resp, ModelResponse):
+                    self._update_stats(resp, is_cached=True)
+
+        # Merge all responses in original order and extract outputs
+        all_responses = (
+            self._merge_responses(cached_responses, uncached_responses)
+            if lotus.settings.enable_cache
+            else uncached_responses
+        )
+        outputs: list[str] = [self._get_top_choice(resp) for resp in all_responses]
+        logprobs = (
+            [self._get_top_choice_logprobs(resp) for resp in all_responses] if all_kwargs.get("logprobs") else None
+        )
+
+        return LMOutput(outputs=outputs, logprobs=logprobs)
+
+    def get_completion(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        show_progress_bar: bool = True,
+        progress_bar_desc: str = "Processing uncached messages",
+        response_format: BaseModel | None = None,
+        **kwargs: dict[str, Any],
+    ) -> str | BaseModel:
+        messages = [
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+        ]
+        output = self(
+            messages,
+            show_progress_bar=show_progress_bar,
+            progress_bar_desc=progress_bar_desc,
+            response_format=response_format,  # type: ignore
+            **kwargs,
+        ).outputs[0]
+        if response_format:
+            return response_format.model_validate_json(output)
+        return output
+
+    def _process_uncached_messages(
+        self,
+        uncached_data: list[tuple[list[dict[str, str]], str]],
+        all_kwargs: dict[str, Any],
+        show_progress_bar: bool,
+        progress_bar_desc: str,
+    ) -> list[ModelResponse]:
+        """
+        Process uncached messages in batches and return responses.
+
+        Args:
+            uncached_data: List of tuples containing (messages, hash) for uncached messages.
+            all_kwargs: Complete keyword arguments for the LLM API.
+            show_progress_bar: Whether to show progress bar.
+            progress_bar_desc: Description for the progress bar.
+
+        Returns:
+            List of ModelResponse objects from the LLM API.
+        """
+        total_calls = len(uncached_data)
+
+        pbar = tqdm(
+            total=total_calls,
+            desc=progress_bar_desc,
+            disable=not show_progress_bar,
+            bar_format="{l_bar}{bar} {n}/{total} LM calls [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+        )
+
+        batch = [msg for msg, _ in uncached_data]
+
+        if self.tpm_limit is not None:
+            uncached_responses = self._process_with_tpm_limiting(batch, all_kwargs, pbar)
+        elif self.rate_limit is not None:
+            uncached_responses = self._process_with_rate_limiting(batch, all_kwargs, pbar)
+        else:
+            uncached_responses = batch_completion(
+                self.model, batch, drop_params=True, max_workers=self.max_batch_size, **all_kwargs
+            )
+            pbar.update(total_calls)
+
+        pbar.close()
+        return uncached_responses
+
+    def _process_with_rate_limiting(
+        self, batch: list[list[dict[str, str]]], all_kwargs: dict[str, Any], pbar: tqdm
+    ) -> list[ModelResponse]:
+        """
+        Process messages with rate limiting applied.
+
+        This method processes messages in batches while respecting the rate limit
+        by adding delays between batches to ensure the rate limit is not exceeded.
+
+        Args:
+            batch: List of message lists to process.
+            all_kwargs: Complete keyword arguments for the LLM API.
+            pbar: Progress bar instance to update.
+
+        Returns:
+            List of ModelResponse objects from the LLM API.
+        """
+        responses = []
+        num_batches = math.ceil(len(batch) / self.max_batch_size)
+        # We know rate_limit is not None because we're in the rate limiting branch
+        assert self.rate_limit is not None
+        min_interval_per_request = 60 / self.rate_limit  # seconds per request
+
+        for i in range(num_batches):
+            start_time = time.time()
+            start_idx = i * self.max_batch_size
+            end_idx = min((i + 1) * self.max_batch_size, len(batch))
+            sub_batch = batch[start_idx:end_idx]
+            sub_responses = batch_completion(
+                self.model, sub_batch, drop_params=True, max_workers=self.max_batch_size, **all_kwargs
+            )
+            responses.extend(sub_responses)
+            pbar.update(len(sub_batch))
+            end_time = time.time()
+            elapsed = end_time - start_time
+
+            # Calculate required delay based on number of requests in this batch
+            # Each request should be spaced by min_interval_per_request
+            required_time_for_batch = len(sub_batch) * min_interval_per_request
+
+            # Only sleep if the batch was faster than the required time
+            if i < num_batches - 1:  # Don't sleep after the last batch
+                to_sleep = required_time_for_batch - elapsed
+                if to_sleep > 0:
+                    time.sleep(to_sleep)
+        return responses
+
+    def _get_tokens_used_in_last_minute(self) -> int:
+        current_time = time.time()
+        while self._token_usage_history and self._token_usage_history[0][0] < current_time - 60:
+            self._token_usage_history.popleft()
+        return sum(tokens for _, tokens in self._token_usage_history)
+
+    def _process_with_tpm_limiting(
+        self, batch: list[list[dict[str, str]]], all_kwargs: dict[str, Any], pbar: tqdm
+    ) -> list[ModelResponse]:
+        assert self.tpm_limit is not None
+        responses = []
+        token_estimates = []
+        max_allowed_tpm = int(self.tpm_limit * 0.95)
+
+        for idx, msg in enumerate(batch):
+            est = self.count_tokens(msg)
+            total_est = est + self.max_tokens
+
+            if total_est > max_allowed_tpm:
+                raise ValueError(
+                    f"Row {idx} estimated size ({total_est} tokens) exceeds your "
+                    f"total TPM limit with safety buffer ({max_allowed_tpm} tokens). "
+                    f"This row is too large to ever be sent on your current API tier. "
+                    f"Please trim your data or upgrade your account tier."
+                )
+            token_estimates.append(est)
+
+        i = 0
+        while i < len(batch):
+            tokens_in_last_minute = self._get_tokens_used_in_last_minute()
+            # Use a 5% safety buffer to avoid tight boundary errors
+            available_tokens = max(0, int(self.tpm_limit * 0.95) - tokens_in_last_minute)
+
+            # Build sub-batch based on available tokens and optional rate (RPM) limit
+            sub_batch = []
+            sub_batch_estimate = 0
+
+            # Determine max possible requests in this specific burst
+            # based on self.max_batch_size AND optional self.rate_limit
+            effective_max_batch = self.max_batch_size
+
+            while i < len(batch):
+                # Include max_tokens in estimate as buffer for the completion
+                est = token_estimates[i] + self.max_tokens
+
+                if sub_batch_estimate + est <= available_tokens:
+                    sub_batch.append(batch[i])
+                    sub_batch_estimate += est
+                    i += 1
+                    if len(sub_batch) >= effective_max_batch:
+                        break
+                else:
+                    # Row doesn't fit in current budget. Stop here.
+                    break
+
+            if sub_batch:
+                start_time = time.time()
+                sub_responses = batch_completion(
+                    self.model, sub_batch, drop_params=True, max_workers=len(sub_batch), **all_kwargs
+                )
+                responses.extend(sub_responses)
+
+                # Record actual usage from response
+                actual_tokens = sum(r.usage.total_tokens for r in sub_responses if hasattr(r, "usage"))
+                self._token_usage_history.append((start_time, actual_tokens))
+                pbar.update(len(sub_batch))
+
+                # IF rate_limit is set, we must also enforce the RPM-based delay
+                # to prevent hitting RPM limits with many small requests.
+                if self.rate_limit is not None:
+                    elapsed = time.time() - start_time
+                    required_time_for_rpm = len(sub_batch) * (60 / self.rate_limit)
+                    to_sleep = required_time_for_rpm - elapsed
+                    if to_sleep > 0:
+                        time.sleep(to_sleep)
+            else:
+                # Need to wait for token window to clear
+                wait_time = 1.0
+                if self._token_usage_history:
+                    wait_time = max(0.1, self._token_usage_history[0][0] + 60.1 - time.time())
+
+                pbar.set_postfix_str(f"TPM Limit reached, waiting {wait_time:.1f}s")
+                time.sleep(wait_time)
+                pbar.set_postfix_str("")
+
+        return responses
+
+    def _cache_response(self, response: ModelResponse, hash: str) -> None:
+        """
+        Cache a response and update stats if successful.
+
+        Args:
+            response: ModelResponse object to cache.
+            hash: Hash key for the cache entry.
+
+        Raises:
+            OpenAIError: If the response contains an error.
+        """
+        if isinstance(response, OpenAIError):
+            raise response
+        self.cache.insert(hash, response)
+
+    def _hash_messages(self, messages: list[dict[str, str]], kwargs: dict[str, Any]) -> str:
+        """Hash messages and kwargs to create a unique key for the cache"""
+        to_hash = str(self.model) + str(messages) + str(kwargs)
+        return hashlib.sha256(to_hash.encode()).hexdigest()
+
+    def _merge_responses(
+        self, cached_responses: list[ModelResponse | None], uncached_responses: list[ModelResponse]
+    ) -> list[ModelResponse]:
+        """Merge cached and uncached responses, maintaining order"""
+        uncached_iter = iter(uncached_responses)
+        return [resp if resp is not None else next(uncached_iter) for resp in cached_responses]
+
+    def _check_usage_limit(self, usage: LMStats.TotalUsage, limit: UsageLimit, usage_type: str):
+        """Helper to check if usage exceeds limits"""
+        if (
+            usage.prompt_tokens > limit.prompt_tokens_limit
+            or usage.completion_tokens > limit.completion_tokens_limit
+            or usage.total_tokens > limit.total_tokens_limit
+            or usage.total_cost > limit.total_cost_limit
+        ):
+            raise LotusUsageLimitException(f"Usage limit exceeded. Current {usage_type} usage: {usage}, Limit: {limit}")
+
+    def _update_usage_stats(self, usage: LMStats.TotalUsage, response: ModelResponse, cost: float | None):
+        """Helper to update usage statistics including cached tokens"""
+        if hasattr(response, "usage") and response.usage:
+            usage.prompt_tokens += response.usage.prompt_tokens or 0
+            usage.completion_tokens += response.usage.completion_tokens or 0
+            usage.total_tokens += response.usage.total_tokens or 0
+            if cost is not None:
+                usage.total_cost += cost
+
+            # Extract cached token information from prompt_tokens_details if available
+            if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
+                details = response.usage.prompt_tokens_details
+                if isinstance(details, dict):
+                    cached_tokens = details.get("cached_tokens", 0) or 0
+                    cache_creation_tokens = details.get("cache_creation_tokens", 0) or 0
+                else:
+                    cached_tokens = getattr(details, "cached_tokens", 0) or 0
+                    cache_creation_tokens = getattr(details, "cache_creation_tokens", 0) or 0
+
+                usage.cached_prompt_tokens += cached_tokens
+                usage.cache_creation_tokens += cache_creation_tokens
+
+    def _update_stats(self, response: ModelResponse, is_cached: bool = False):
+        """
+        Update usage statistics from a model response.
+
+        Uses LiteLLM's completion_cost() function which:
+        - Maintains up-to-date pricing for 100+ models
+        - Automatically handles cached tokens and their different pricing
+        - Supports all token types (input, cached, cache creation, output, image)
+
+        Args:
+            response: The ModelResponse from LiteLLM
+            is_cached: Whether this response came from Lotus's operator cache
+        """
+        if not hasattr(response, "usage"):
+            return
+
+        # Use LiteLLM's completion_cost (handles cached tokens automatically)
+        cost = calculate_cost_from_response(response)
+
+        if cost is not None:
+            lotus.logger.debug(f"Calculated cost: ${cost:.6f} for model {self.model}")
+        else:
+            lotus.logger.debug(f"No pricing information available for model {self.model}")
+            warnings.warn(f"No pricing information available for model {self.model}. ")
+
+        # Always update virtual usage
+        self._update_usage_stats(self.stats.virtual_usage, response, cost)
+        self._check_usage_limit(self.stats.virtual_usage, self.virtual_usage_limit, "virtual")
+
+        # Only update physical usage for non-cached responses
+        if not is_cached:
+            self._update_usage_stats(self.stats.physical_usage, response, cost)
+            self._check_usage_limit(self.stats.physical_usage, self.physical_usage_limit, "physical")
+
+    def _get_top_choice(self, response: ModelResponse) -> str:
+        # Handle authentication errors and other exceptions
+        if isinstance(response, (AuthenticationError, OpenAIError)):
+            raise response
+
+        choice = response.choices[0]
+        assert isinstance(choice, Choices)
+        if choice.message.content is None:
+            raise ValueError(f"No content in response: {response}")
+        return choice.message.content
+
+    def _get_top_choice_logprobs(self, response: ModelResponse) -> list[ChatCompletionTokenLogprob]:
+        # Handle authentication errors and other exceptions
+        if isinstance(response, (AuthenticationError, OpenAIError)):
+            raise response
+
+        choice = response.choices[0]
+        assert isinstance(choice, Choices)
+        assert choice.logprobs is not None and isinstance(choice.logprobs, ChoiceLogprobs)
+        logprobs = choice.logprobs["content"]
+        return logprobs
+
+    def format_logprobs_for_cascade(self, logprobs: list[list[ChatCompletionTokenLogprob]]) -> LogprobsForCascade:
+        all_tokens = []
+        all_confidences = []
+        for resp_logprobs in logprobs:
+            tokens = [logprob.token for logprob in resp_logprobs]
+            confidences = [np.exp(logprob.logprob) for logprob in resp_logprobs]
+            all_tokens.append(tokens)
+            all_confidences.append(confidences)
+        return LogprobsForCascade(tokens=all_tokens, confidences=all_confidences)
+
+    def format_logprobs_for_filter_cascade(
+        self,
+        logprobs: list[list[ChatCompletionTokenLogprob]],
+        output_tokens: tuple[str, str] = ("True", "False"),
+    ) -> LogprobsForFilterCascade:
+        positive_token, negative_token = output_tokens
+        base_cascade = self.format_logprobs_for_cascade(logprobs)
+        all_positive_probs = []
+
+        def get_normalized_positive_prob(token_probs: dict[str, float]) -> float | None:
+            if positive_token in token_probs and negative_token in token_probs:
+                pos_prob = token_probs[positive_token]
+                neg_prob = token_probs[negative_token]
+                return pos_prob / (pos_prob + neg_prob)
+            return None
+
+        for resp_idx, response_logprobs in enumerate(logprobs):
+            pos_prob = None
+            for logprob in response_logprobs:
+                token_probs = {top.token: np.exp(top.logprob) for top in logprob.top_logprobs}
+                pos_prob = get_normalized_positive_prob(token_probs)
+                if pos_prob is not None:
+                    break
+
+            if pos_prob is None:
+                pos_prob = 1 if positive_token in base_cascade.tokens[resp_idx] else 0
+
+            all_positive_probs.append(pos_prob)
+
+        return LogprobsForFilterCascade(
+            tokens=base_cascade.tokens, confidences=base_cascade.confidences, positive_probs=all_positive_probs
+        )
+
+    def count_tokens(self, messages: list[dict[str, str]] | str) -> int:
+        """Count tokens in messages using either custom tokenizer or model's default tokenizer"""
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+
+        custom_tokenizer: dict[str, Any] | None = None
+        if self.tokenizer:
+            custom_tokenizer = dict(type="huggingface_tokenizer", tokenizer=self.tokenizer)
+
+        return token_counter(
+            custom_tokenizer=custom_tokenizer,
+            model=self.model,
+            messages=messages,
+        )
+
+    def encode_text(self, text: str) -> list[int]:
+        """Encode text into tokens using either custom tokenizer or model's default tokenizer"""
+        custom_tokenizer: dict[str, Any] | None = None
+        if self.tokenizer:
+            custom_tokenizer = dict(type="huggingface_tokenizer", tokenizer=self.tokenizer)
+        return encode(model=self.model, text=text, custom_tokenizer=custom_tokenizer)
+
+    def decode_tokens(self, tokens: list[int]) -> str:
+        """Decode tokens into text using either custom tokenizer or model's default tokenizer"""
+        custom_tokenizer: dict[str, Any] | None = None
+        if self.tokenizer:
+            custom_tokenizer = dict(type="huggingface_tokenizer", tokenizer=self.tokenizer)
+        return decode(model=self.model, tokens=tokens, custom_tokenizer=custom_tokenizer)
+
+    def print_total_usage(self):
+        print("\n=== Usage Statistics ===")
+        print("Virtual  = Total usage if no caching was used")
+        print("Physical = Actual usage with caching applied\n")
+        print(f"Virtual Cost:     ${self.stats.virtual_usage.total_cost:,.6f}")
+        print(f"Physical Cost:    ${self.stats.physical_usage.total_cost:,.6f}")
+        print(f"Virtual Tokens:   {self.stats.virtual_usage.total_tokens:,}")
+        print(f"Physical Tokens:  {self.stats.physical_usage.total_tokens:,}")
+        print(f"Cache Hits:       {self.stats.cache_hits:,}\n")
+
+    def reset_stats(self):
+        self.stats = LMStats()
+
+    def reset_cache(self, max_size: int | None = None):
+        self.cache.reset(max_size)
+
+    def get_model_name(self) -> str:
+        raw_model = self.model
+        if not raw_model:
+            return ""
+
+        # If a slash is present, assume the model name is after the last slash.
+        if "/" in raw_model:
+            candidate = raw_model.split("/")[-1]
+        else:
+            candidate = raw_model
+
+        # If a colon is present, assume the model version is appended and remove it.
+        if ":" in candidate:
+            candidate = candidate.split(":")[0]
+
+        return candidate.lower()
+
+    def is_deepseek(self) -> bool:
+        model_name = self.get_model_name()
+        return model_name.startswith("deepseek-r1")

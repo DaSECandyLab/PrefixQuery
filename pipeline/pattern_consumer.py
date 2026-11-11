@@ -200,6 +200,7 @@ class GlobalTreeBuilder:
             sub_df = dataset.iloc[row_ids]
             row_iter = zip(row_ids, sub_df.to_dict('records'))
 
+        self.weights = []                       
         for row_id, row_dict in row_iter:
             if row_id in rows_excluded_set:
                 continue
@@ -207,7 +208,7 @@ class GlobalTreeBuilder:
             for column_name, value in row_dict.items():
                 formatted_row.append(f"{column_name}: _{value}")
             self.trees.append(TreeNode(values=formatted_row, row_id=row_id, childs=None))
-        
+            self.weights.append(1)              
    
     def __repr__(self):
         return "Global Tree Group"
@@ -224,22 +225,31 @@ class GlobalTreeBuilder:
             
     def merge_trees(self, shared_prefix_dict: dict[int, list[int]]):
         merged_tree_indexes = []
+        new_roots = []
         for k, v in shared_prefix_dict.items():
-            if len(v) == 0: 
+            if len(v) == 0:
                 continue
             pattern = self.pattern_to_id_bidict.inv[k]
-            values = list(pattern) 
-            childs = [self.trees[i] for i in v] 
-            row_id = None
+            pattern_set = frozenset(pattern)
+            anchor_id = max(v, key=lambda t: self.weights[t])
+            anchor_values = self.trees[anchor_id].values
+            ordered = [x for x in anchor_values if x in pattern_set]
+            assert len(ordered) == len(pattern_set)      
+            childs = [self.trees[i] for i in v]
+            weight = sum(self.weights[i] for i in v)
             merged_tree_indexes.extend(v)
-            
             for child in childs:
                 child.remove_cols(pattern)
-            
-            self.trees.append(TreeNode(values=values, childs=childs, row_id=row_id))
-            
+            new_roots.append((TreeNode(values=ordered, childs=childs, row_id=None), weight))
+        if not merged_tree_indexes:
+            return
         merged_tree_indexes_set = set(merged_tree_indexes)
         self.trees = [x for i, x in enumerate(self.trees) if i not in merged_tree_indexes_set]
+        self.weights = [w for i, w in enumerate(self.weights) if i not in merged_tree_indexes_set]
+        for node, w in new_roots:
+            self.trees.append(node)
+            self.weights.append(w)
+
     
     def next_iteration(self):
         pattern_to_tree_dict = {}
@@ -301,8 +311,10 @@ class GlobalTreeBuilder:
             if len(v) == 0:
                 continue
             t_a = self.pattern_to_benefit_dict[k]
-            n_a = len(v)
-            avg_benefit = 1.0 * t_a * (n_a - 1) / n_a
+            # n_a = len(v)
+            # avg_benefit = 1.0 * t_a * (n_a - 1) / n_a
+            N_a = sum(self.weights[t] for t in v)         
+            avg_benefit = 1.0 * t_a * (N_a - 1) / N_a     
             moved_dict = {}
             all_rows_have_target = True
             for tree_id in v:
