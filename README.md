@@ -7,9 +7,7 @@ fasttree - the core code of our decoding attention kernel plugin.
 
 pipeline - the core code of our pattern miner and data reorganizer, including pipeline strategy and reordering method.
 
-lotus - relational interface, with llm operators supported.
-
-note, you can install sglang with system command. Therefore, we do not provide the sglang source code.
+lotus - relational interface provider, with LLMs operators supported.
 
 ## Proof
 
