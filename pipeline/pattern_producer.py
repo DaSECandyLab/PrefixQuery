@@ -686,65 +686,48 @@ class NegFIN:
     def __extract_and_write_partition(self):
         if self.pattern_registry is None or not self.pattern_registry.key_to_node:
             return
-
         num_rows = len(self.dataset)
         if self.output_row_mask_np is None or self.output_row_mask_np.shape[0] != num_rows:
             self.output_row_mask_np = np.zeros(num_rows, dtype=bool)
-
         all_nodes = list(self.pattern_registry.key_to_node.values())
         for node in all_nodes:
             node.score = self.compute_pattern_score(node)
-        all_nodes.sort(key=lambda n: n.score, reverse=True)
-        all_nodes = [n for n in all_nodes if n.unextracted_count > 0]
+
+        candidates = [n for n in all_nodes if n.unextracted_count > 0]
+        if not candidates:
+            return
+        candidates.sort(key=lambda n: n.score, reverse=True)
+        candidates = candidates[:128]         
+
+
+        selected_patterns, _ = self.__beam_search_select_patterns(
+            candidates, ROW_SCALE_THRESHOLD_S, beam_width=3)
+        if not selected_patterns:
+            return
+        selected_ids = set(id(p) for p in selected_patterns)
 
         partition_rows = []
-        newly_output_count = 0
-        for node in all_nodes:
+        for node in selected_patterns:
             if node.unextracted_rows is not None:
-                rows = node.unextracted_rows
-                rows_to_add = rows[~self.output_row_mask_np[rows]]
+                rows = node.unextracted_rows[~self.output_row_mask_np[node.unextracted_rows]]
             elif node.unextracted_mask is not None:
                 buf = np.frombuffer(node.unextracted_mask.tobytes(), dtype=np.uint8)
                 bits = np.unpackbits(buf, bitorder='big')[:num_rows]
                 rows = np.flatnonzero(bits)
-                rows_to_add = rows[~self.output_row_mask_np[rows]]
+                rows = rows[~self.output_row_mask_np[rows]]
             else:
                 continue
-            if rows_to_add.size == 0:
-                continue
-
-            if newly_output_count + rows_to_add.size <= ROW_SCALE_THRESHOLD_S:
-                self.output_row_mask_np[rows_to_add] = True
-                partition_rows.append(rows_to_add)
-                newly_output_count += int(rows_to_add.size)
-                node.unextracted_rows = None
-                node.unextracted_mask = None
-                node.unextracted_count = 0
-                if newly_output_count == ROW_SCALE_THRESHOLD_S:
-                    break   
-            else:
-                need = ROW_SCALE_THRESHOLD_S - newly_output_count
-                chosen, remaining = self.__hard_threshold_select(
-                    node, rows_to_add, need, all_nodes)
-                if chosen.size:
-                    self.output_row_mask_np[chosen] = True
-                    partition_rows.append(chosen)
-                    newly_output_count += int(chosen.size)   
-
-                if remaining.size:
-                    node.unextracted_rows = remaining.astype(np.int32)
-                    node.unextracted_mask = None
-                    node.unextracted_count = int(remaining.size)
-                else:
-                    node.unextracted_rows = None
-                    node.unextracted_mask = None
-                    node.unextracted_count = 0
-                break   
-
-
+            if rows.size:
+                self.output_row_mask_np[rows] = True
+                partition_rows.append(rows)
+            node.unextracted_rows = None
+            node.unextracted_mask = None
+            node.unextracted_count = 0
 
         not_packed = self.np_packed_not(self.output_row_mask_np, num_rows)
-        for node in all_nodes:
+        for node in candidates:
+            if id(node) in selected_ids:
+                continue
             if node.unextracted_count > 0:
                 if node.unextracted_rows is not None:
                     keep = ~self.output_row_mask_np[node.unextracted_rows]
@@ -756,23 +739,21 @@ class NegFIN:
 
         if not partition_rows:
             return
-
         dedup_ids = np.concatenate(partition_rows)
         orig_ids = self.__expand_to_original_ids(dedup_ids)
-
         partition_name = os.path.basename(
             f"{self.filepath_prefix}_partition_{self.partition_suffix_id}.txt")
         with open(f"{self.filepath_prefix}_partition_{self.partition_suffix_id}.txt",
-                  'w', encoding='utf-8') as f:
+                'w', encoding='utf-8') as f:
             for rid in orig_ids:
                 f.write(f"{rid}\n")
             f.flush()
             os.fsync(f.fileno())
         self.partition_suffix_id += 1
-
         ok = self.partition_queue.push(partition_name)
         self.__sync_not_output_mask()
         self._heap_dirty = True
+
 
     def __hard_threshold_select(self, pattern_a: PatternNode,
                                 candidate_rows: np.ndarray, need: int,
@@ -818,6 +799,55 @@ class NegFIN:
         remain_mask = np.ones(n, dtype=bool)
         remain_mask[chosen_idx] = False
         return chosen, rows[remain_mask]
+
+    def __beam_search_select_patterns(self, candidates: list, batch_size: int,
+                                    beam_width: int = 3):
+        num_rows = len(self.dataset)
+        states = [(self.output_row_mask_np.copy(), 0.0, 0, [])]
+        for _ in range(64):
+            expanded = []
+            all_term = True
+            for covered, benefit, nrows, pats in states:
+                if nrows >= batch_size:
+                    expanded.append((benefit, nrows, pats, None, covered))
+                    continue
+                all_term = False
+                for node in candidates:
+                    if any(node is p for p in pats):
+                        continue
+                    if node.unextracted_rows is not None:
+                        new_rows = node.unextracted_rows[~covered[node.unextracted_rows]]
+                    elif node.unextracted_mask is not None:
+                        buf = np.frombuffer(node.unextracted_mask.tobytes(), dtype=np.uint8)
+                        bits = np.unpackbits(buf, bitorder='big')[:num_rows]
+                        all_rows = np.flatnonzero(bits)
+                        new_rows = all_rows[~covered[all_rows]]
+                    else:
+                        continue
+                    if new_rows.size == 0:
+                        continue
+                    delta_n = int(new_rows.size)
+                    delta_B = (delta_n - 1) * node.token_length
+
+                    expanded.append((benefit + delta_B, nrows + delta_n,
+                                    pats + [node], new_rows, covered))
+            if not expanded or all_term:
+                break
+            expanded.sort(key=lambda s: s[0] / max(s[1], 1), reverse=True)
+            states = []
+            for benefit, nrows, pats, new_rows, covered in expanded[:beam_width]:
+                if new_rows is None:                       
+                    states.append((covered, benefit, nrows, pats))
+                else:                                      
+                    nc = covered.copy()
+                    nc[new_rows] = True
+                    states.append((nc, benefit, nrows, pats))
+            if all(s[2] >= batch_size for s in states):
+                break
+        if not states:
+            return [], None
+        best = max(states, key=lambda s: s[1] / max(s[2], 1))
+        return best[3], best[0]
 
 
     def __expand_to_original_ids(self, dedup_ids: np.ndarray) -> list:
