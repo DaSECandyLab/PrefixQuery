@@ -302,8 +302,6 @@ class LLMEvalDataframe:
             return
         
         if mock_llm:
-            print("[INFO] mock_llm 已启用，跳过 SGLang Runtime 初始化"
-                  "（模拟处理模式，不调用 GPU）。", flush=True)
             return
         
         parser = argparse.ArgumentParser()
